@@ -4,6 +4,18 @@ import PlaygroundSupport
 import UIKit
 import Foundation
 
+//
+// MARK: Helpers
+//
+
+func log(_ message: @autoclosure () -> String, function: String = #function, file: String = #file, line: Int = #line) {
+    print("[\(function)@\(line)] \(message())")
+}
+
+//
+// MARK: Number
+//
+
 typealias Number = Double
 
 extension Number {
@@ -72,60 +84,136 @@ extension Number {
     }
 }
 
+typealias Level = Int
+
+struct Curve { // describes a curve which depends on a level
+    typealias CurveFunction = (level: Level) -> Number
+    
+    let value: CurveFunction
+    
+    init(value: CurveFunction) {
+        self.value = value
+    }
+    
+    static func linear(initialValue: Double = 0, factor: Double = 1) -> Curve {
+        return Curve { level in Double(level) * factor + initialValue }
+    }
+    
+    static func exponential() -> Curve {
+        return Curve { level in exp(Double(level)) }
+    }
+    
+    static func flat(value: Double) -> Curve {
+        return Curve { _ in value }
+    }
+}
+
+//
+// MARK: Domain Description
+//
+
+typealias Identifier = String
+
+extension Identifier {
+    static func newUniqueIdentifier() -> Identifier { return NSUUID().uuidString }
+}
+
+protocol Identifiable {
+    var identifier: Identifier { get }
+}
+
+struct ResourceDescription: Identifiable {
+    let identifier: Identifier
+    let displayName: String
+    
+    init(identifier: Identifier = .newUniqueIdentifier(), displayName: String) {
+        self.displayName = displayName
+        self.identifier = identifier
+    }
+}
+
+
+struct CostDescription {
+    let resource: ResourceDescription
+    let curve: Curve // in cost/level
+}
+
+protocol Upgradable: Identifiable {
+    var curve: Curve { get }
+}
+
+struct UpgradeDescription<T: Upgradable>: Identifiable {
+    let identifier: Identifier
+    
+    let target: T
+    let costs: [CostDescription]
+    
+    init(identifier: Identifier = .newUniqueIdentifier(), target: T, costs: [CostDescription]) {
+        self.identifier = identifier
+        self.target = target
+        self.costs = costs
+    }
+}
+
+struct ResourceGeneratorFlags: OptionSet {
+    typealias RawValue = Int
+    let rawValue: Int
+    
+    init(rawValue: Int) { self.rawValue = rawValue }
+    
+    static let automatic = ResourceGeneratorFlags(rawValue: 1 << 0) // generates resource each tick
+}
+
+struct ResourceGeneratorDescription: Upgradable {
+    let identifier: Identifier
+    
+    let resource: ResourceDescription
+    let curve: Curve // in resource unit/s
+    let flags: ResourceGeneratorFlags // maybe a set of enum would be better because associated types could help
+    // for example cooldowns, conditions
+    
+    init(identifier: Identifier = .newUniqueIdentifier(), resource: ResourceDescription, curve: Curve, flags: ResourceGeneratorFlags = []) {
+        self.identifier = identifier
+        self.resource = resource
+        self.curve = curve
+        self.flags = flags
+    }
+}
+
 //
 // MARK: Resource
 //
 
-final class Resource {
+final class ResourceComponent {
     var value: Number = .zero
 }
 
-typealias Curve = (level: Int, value: Number) -> Number // describes a curve which depends on a level
-
-enum Curves {
-    static let linear: Curve = { level, value in return Double(level) * value }
-    static let exponential: Curve = { level, value in return exp(Double(level)) * value }
+final class UpgradeComponent {
+    var level: Level = 0
 }
 
-class TickHandler {
+struct SimulationConfiguration {
+    let timeMultiplier: Double
     
-    typealias OnTick = (delta: CFTimeInterval) -> Void
-    
-    let onTick: OnTick
-    
-    init(_ onTick: OnTick) {
-        self.onTick = onTick
-    }
-}
-
-extension TickHandler {
-    
-    static func resourceAutoIncrementer(resource: Resource, level: () -> Int, generationPerSecond: Number, curve: Curve) -> TickHandler {
-        return TickHandler { delta in
-            resource.value += delta * curve(level: level(), value: generationPerSecond)
-        }
-    }
-    
-    static func resourceIncrementer<T>(simulation: Simulation, increment: (T) -> Void) -> (T) -> Void {
-        
-        let incrementFunc: (T) -> Void = { argument in
-            simulation.queue.async {
-                if !simulation.paused {
-                    increment(argument)
-                }
-            }
-        }
-        return incrementFunc
-    }
+    static let defaultConfiguration = SimulationConfiguration(timeMultiplier: 1)
 }
 
 final class Simulation {
     private let queue: DispatchQueue
     private let timer: DispatchSourceTimer
     private var lastTickTime: CFTimeInterval
+    private var configuration: SimulationConfiguration = .defaultConfiguration
+    
+    private var resources = [Identifier: ResourceComponent]()
+    private var upgrades = [Identifier: UpgradeComponent]()
+    private var generators = [ResourceGeneratorDescription]()
     
     private(set) var totalDuration: CFTimeInterval
     let name: String
+    
+    func update(configuration: SimulationConfiguration) {
+        queue.async { self.configuration = configuration }
+    }
     
     var paused: Bool = true {
         didSet { if paused != oldValue { pausedDidChange() } }
@@ -146,7 +234,7 @@ final class Simulation {
     
     private func tick() {
         let now = CACurrentMediaTime()
-        let delta = now - lastTickTime
+        let delta = (now - lastTickTime) * configuration.timeMultiplier
         
         update(delta: delta)
         
@@ -156,7 +244,12 @@ final class Simulation {
     private func update(delta: CFTimeInterval) {
         guard delta > 0 else { return }
         
-        tickHandlers.forEach { $0.onTick(delta: delta) }
+        generators
+            .filter { !$0.flags.isDisjoint(with: .automatic) }
+            .forEach { generate(for: $0, multiplier: delta) }
+        
+        // call the ontick handler on main queue
+        DispatchQueue.main.async { self.onTick?() }
         
         totalDuration += delta
     }
@@ -170,17 +263,96 @@ final class Simulation {
         }
     }
     
-    var tickHandlers = [TickHandler]()
-    func addTickHandlers(handlers: [TickHandler]) {
-        queue.async {
-            handlers.forEach { self.tickHandlers.append($0) }
-        }
-    }
-    
-    func moveForward(interval: CFTimeInterval) {
+    func fastForward(interval: CFTimeInterval) {
         queue.async {
             self.update(delta: interval)
         }
+    }
+    
+    /// todo: make method below available from a transaction with locking with simulation update
+    
+    func register<T>(upgrade: UpgradeDescription<T>) {
+        upgrades[upgrade.target.identifier] = UpgradeComponent()
+    }
+    
+    func register(resource: ResourceDescription) {
+        resources[resource.identifier] = ResourceComponent()
+    }
+    
+    func register(automaticGenerator generator: ResourceGeneratorDescription) {
+        generators.append(generator) // make it a set
+    }
+    
+    func value(of resource: ResourceDescription) -> Number {
+        guard let resourceComponent = resources[resource.identifier] else {
+            log("ERROR> No Resource found for \(resource)")
+            return 0
+        }
+        return resourceComponent.value
+    }
+    
+    struct UpgradeInfo {
+        let value: Number
+        let level: Level
+        let costs: [(String, Number)]
+    }
+    
+    func info<T>(for upgradable: UpgradeDescription<T>) -> UpgradeInfo {
+        guard let upgradeComponent = upgrades[upgradable.target.identifier] else {
+            log("ERROR> No Upgrade found for \(upgradable)")
+            return UpgradeInfo(value: 0, level: 0, costs: [])
+        }
+        
+        let value = upgradable.target.curve.value(level: upgradeComponent.level)
+        let costs = upgradable.costs.map { (costDescription: CostDescription) -> (String, Number) in
+            let cost = costDescription.curve.value(level: upgradeComponent.level+1)
+            return (costDescription.resource.displayName, cost)
+        }
+        return UpgradeInfo(value: value, level: upgradeComponent.level, costs: costs)
+    }
+    
+    func upgrade<T>(_ upgradable: UpgradeDescription<T>) {
+        guard let upgradeComponent = upgrades[upgradable.target.identifier] else {
+            log("ERROR> No Upgrade found for \(upgradable)")
+            return
+        }
+        
+        var payments = [() -> Void]()
+        for costDescription in upgradable.costs {
+            guard let resource = resources[costDescription.resource.identifier] else {
+                log("ERROR> No Resource found for \(costDescription)")
+                return
+            }
+            
+            let cost = costDescription.curve.value(level: upgradeComponent.level)
+            if cost > resource.value {
+                log("OOPS> Not Enough \(costDescription.resource) (\(resource.value)/\(cost))")
+                return
+            }
+            
+            payments.append { resource.value -= cost }
+        }
+        
+        payments.forEach { $0() }
+        upgradeComponent.level += 1
+    }
+    
+    func generate(for resource: ResourceGeneratorDescription) {
+        //guard resource.flags.isDisjoint(with: .automatic) else { return }
+        generate(for: resource, multiplier: 1)
+    }
+    
+    private func generate(for resource: ResourceGeneratorDescription, multiplier: Double) {
+        guard let upgradeComponent = upgrades[resource.identifier] else {
+            log("ERROR> No Upgrade found for \(resource)")
+            return
+        }
+        guard let resourceComponent = resources[resource.resource.identifier] else {
+            log("ERROR> No Resource found for \(resource)")
+            return
+        }
+        
+        resourceComponent.value += resource.curve.value(level: upgradeComponent.level)
     }
 }
 
@@ -199,18 +371,41 @@ extension Simulation {
 }
 
 let simulation = Simulation(name: "test", interval: 1)
-let gold = Resource()
 
-var gLevel = 1
-let gGenerator = TickHandler.resourceAutoIncrementer(resource: gold, level: { gLevel }, generationPerSecond: 1, curve: Curves.exponential)
+//
+// MARK: Game Instantiation
+//
 
-let ggClicker = TickHandler.resourceIncrementer(simulation: simulation) { () -> Void in
-    gLevel += 100
-}
+let gold = ResourceDescription(displayName: "👺")
+
+let goldTapper = ResourceGeneratorDescription(resource: gold,
+                                              curve: .linear(initialValue: 1, factor: 1))
+let goldTapperUpgrade = UpgradeDescription(
+    target: goldTapper,
+    costs: [
+        CostDescription(resource: gold,
+                        curve: .linear(initialValue: 10, factor: 3))
+    ])
+
+let goldGenerator = ResourceGeneratorDescription(resource: gold,
+                                                 curve: .linear(initialValue: 0, factor: 0.7),
+                                                 flags: .automatic)
+let goldGeneratorUpgrade = UpgradeDescription(
+    target: goldGenerator,
+    costs: [
+        CostDescription(resource: gold,
+                        curve: .exponential())
+    ])
 
 //
 // MARK: UI
 //
+
+extension Simulation.UpgradeInfo {
+    var userFacingCosts: String {
+        return costs.map { name, price in "\(price.gameDescription) \(name)" }.joined(separator: ",")
+    }
+}
 
 class IncrementalViewController: UIViewController {
     
@@ -219,24 +414,29 @@ class IncrementalViewController: UIViewController {
     lazy var moveForward = UIButton(type: .system)
     lazy var goldLabel = UILabel()
     lazy var tapButton = UIButton(type: .system)
-    lazy var updateButton = UIButton(type: .system)
+    lazy var upgradeGoldGenButton = UIButton(type: .system)
+    lazy var upgradeGoldTapButton = UIButton(type: .system)
     
     override func viewDidLoad() {
         super.viewDidLoad()
         
         view.backgroundColor = .white
         
-        [ stack, toggle, moveForward, goldLabel, tapButton, updateButton ].forEach { $0.translatesAutoresizingMaskIntoConstraints = false }
+        [ stack, toggle, moveForward, goldLabel, tapButton, upgradeGoldGenButton, upgradeGoldTapButton ].forEach { $0.translatesAutoresizingMaskIntoConstraints = false }
         
         view.addSubview(stack)
         stack.addArrangedSubview(toggle)
         stack.addArrangedSubview(moveForward)
         stack.addArrangedSubview(goldLabel)
         stack.addArrangedSubview(tapButton)
-        stack.addArrangedSubview(updateButton)
+        stack.addArrangedSubview(upgradeGoldTapButton)
+        stack.addArrangedSubview(upgradeGoldGenButton)
         
-        updateButton.setTitle("Upgrade gold generation", for: .normal)
-        updateButton.addTarget(self, action: #selector(updateGold), for: .touchUpInside)
+        
+        upgradeGoldTapButton.setTitle("Upgrade gold Tap value", for: .normal)
+        upgradeGoldTapButton.addTarget(self, action: #selector(upgradeGoldTap), for: .touchUpInside)
+        upgradeGoldGenButton.setTitle("Upgrade gold generation", for: .normal)
+        upgradeGoldGenButton.addTarget(self, action: #selector(upgradeGoldGeneration), for: .touchUpInside)
         tapButton.setTitle("Tap for more gold !", for: .normal)
         tapButton.addTarget(self, action: #selector(tap), for: .touchDown)
         goldLabel.numberOfLines = 0
@@ -254,16 +454,23 @@ class IncrementalViewController: UIViewController {
         ])
     }
     
-    func updateGold() {
-        ggClicker()
+    func upgradeGoldTap() {
+        simulation.upgrade(goldTapperUpgrade)
+        refresh()
+    }
+    
+    func upgradeGoldGeneration() {
+        simulation.upgrade(goldGeneratorUpgrade)
+        refresh()
     }
     
     func tap() {
-        gClicker()
+        simulation.generate(for: goldTapper)
+        refresh()
     }
     
     func moveForwardTouched() {
-        simulation.moveForward(interval: 120)
+        simulation.fastForward(interval: 120)
     }
     
     func togglePaused() {
@@ -271,25 +478,39 @@ class IncrementalViewController: UIViewController {
     }
     
     func refresh() {
+        let goldTapInfo = simulation.info(for: goldTapperUpgrade)
+        let goldGenInfo = simulation.info(for: goldGeneratorUpgrade)
+        
         let infos = [
-            "gold: \(gold.value.gameDescription) (level: \(gLevel))",
+            "in my pocket: \(simulation.value(of: gold).gameDescription)\(gold.displayName)",
+            "tap: level \(goldTapInfo.level) ~ \(goldTapInfo.value)/tap ~ upgrade for \(goldTapInfo.userFacingCosts)",
+            "mine: level \(goldGenInfo.level) ~ \(goldGenInfo.value)/s ~ upgrade for \(goldGenInfo.userFacingCosts)",
             "duration: \(Int(simulation.totalDuration))s",
         ]
         self.goldLabel.text = infos.joined(separator: "\n")
     }
 }
 
+//
+// MARK: UI Instantiation
+//
+
+
 let viewController = IncrementalViewController()
+simulation.register(resource: gold)
+simulation.register(automaticGenerator: goldGenerator)
+simulation.register(upgrade: goldGeneratorUpgrade)
+simulation.register(upgrade: goldTapperUpgrade)
 
-let gClicker = TickHandler.resourceIncrementer(simulation: simulation) { () -> Void in
-    gold.value += 10
-    DispatchQueue.main.async { viewController.refresh() }
+log(">>>")
+log("Upgrades   : \(simulation.upgrades)")
+log("Resources  : \(simulation.resources)")
+log("Generators : \(simulation.generators)")
+log("<<<")
+
+
+simulation.onTick = {
+    viewController.refresh()
 }
-
-let UIUpdater = TickHandler { _ in DispatchQueue.main.async { viewController.refresh() } }
-
-simulation.addTickHandlers(handlers: [
-    gGenerator, UIUpdater
-    ])
 
 PlaygroundPage.current.liveView = viewController
